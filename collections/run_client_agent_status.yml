@@ -1,0 +1,5 @@
+---
+- hosts: all
+  gather_facts: true
+  roles:
+    - name: oneidentity.authentication_services.client_agent_status
