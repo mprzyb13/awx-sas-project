@@ -1,0 +1,36 @@
+---
+
+- hosts: all 
+
+  # The variables you would most likely want/need to override have been included
+  vars:
+
+    # Directories
+    client_sw_dir: "./files/QAS-4.2.4.25529/client"
+    client_sw_tmp_dir: /tmp/1id
+
+    # Software states
+    client_sw_pkg_state:
+      vasclnt: present
+      # vasclnts: check 
+      vasgp: present 
+      # vasgps: check 
+      vassc: present
+      # vascert: check
+      # dnsupdate: check 
+      # pamdefender: present
+      # vasyp: check 
+      # vasqa: check 
+      # vasproxy: check 
+      # vasdev: check 
+
+    # Facts
+    client_sw_facts_generate: true
+    client_sw_facts_verbose: false 
+    
+    # Reports
+    client_sw_reports_generate: true 
+    client_sw_reports_backup: false 
+
+  roles:
+    - name: oneidentity.authentication_services.client_sw
