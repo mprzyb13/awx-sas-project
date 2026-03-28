@@ -1,0 +1,237 @@
+---
+- name: Generate client account activity report compatible with SQL-first importer
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    account_activity_window_days: 90
+    account_activity_reports_host: "127.0.0.1"
+    account_activity_reports_dir: "/var/lib/awx/projects/reports/account_activity"
+    account_activity_raw_dir: "{{ account_activity_reports_dir }}/raw"
+    account_activity_local_workdir: "/var/tmp/account_activity_collect"
+    account_activity_csv_name: "client_account_activity_report.csv"
+    account_activity_collect_lastlog: true
+    account_activity_collect_last: true
+    account_activity_collect_lastb: true
+    account_activity_collect_faillock: true
+    account_activity_collect_journalctl: true
+    account_activity_collect_authlog: true
+    account_activity_collect_auditd: true
+
+  pre_tasks:
+    - name: Ensure local workdir exists on managed host
+      ansible.builtin.file:
+        path: "{{ account_activity_local_workdir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Ensure reports directories exist on controller
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ account_activity_reports_dir }}"
+        - "{{ account_activity_raw_dir }}"
+      delegate_to: "{{ account_activity_reports_host }}"
+
+    - name: Capture UTC collection timestamp
+      ansible.builtin.set_fact:
+        account_activity_collected_at_utc: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Collect passwd database
+      ansible.builtin.command: getent passwd
+      register: getent_passwd_cmd
+      changed_when: false
+
+    - name: Collect group database
+      ansible.builtin.command: getent group
+      register: getent_group_cmd
+      changed_when: false
+
+    - name: Read /etc/shadow safely
+      ansible.builtin.shell: |
+        awk -F: '{print $1":"$2":"$3":"$4":"$5":"$6":"$7":"$8":"$9}' /etc/shadow
+      args:
+        executable: /bin/bash
+      register: shadow_cmd
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Build local user list from getent passwd
+      ansible.builtin.set_fact:
+        account_activity_local_users: >-
+          {{
+            getent_passwd_cmd.stdout_lines
+            | map('split', ':')
+            | selectattr('0', 'defined')
+            | map('first')
+            | list
+          }}
+
+  tasks:
+    - name: Collect passwd -S for each user
+      ansible.builtin.command: "passwd -S {{ item }}"
+      register: passwd_status_cmd
+      changed_when: false
+      failed_when: false
+      loop: "{{ account_activity_local_users }}"
+
+    - name: Collect chage -l for each user
+      ansible.builtin.command: "chage -l {{ item }}"
+      register: chage_cmd
+      changed_when: false
+      failed_when: false
+      loop: "{{ account_activity_local_users }}"
+
+    - name: Collect lastlog for each user
+      ansible.builtin.command: "lastlog -u {{ item }}"
+      register: lastlog_cmd
+      changed_when: false
+      failed_when: false
+      loop: "{{ account_activity_local_users }}"
+      when: account_activity_collect_lastlog
+
+    - name: Collect faillock for each user
+      ansible.builtin.command: "faillock --user {{ item }}"
+      register: faillock_cmd
+      changed_when: false
+      failed_when: false
+      loop: "{{ account_activity_local_users }}"
+      when: account_activity_collect_faillock
+
+    - name: Collect successful login history with source IPs
+      ansible.builtin.shell: |
+        set -o pipefail
+        last -F -i -w | head -n 5000
+      args:
+        executable: /bin/bash
+      register: last_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_last
+
+    - name: Collect failed login history with source IPs
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -f /var/log/btmp ]; then
+          lastb -F -i -w | head -n 5000
+        else
+          true
+        fi
+      args:
+        executable: /bin/bash
+      register: lastb_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_lastb
+
+    - name: Collect journalctl auth-related entries
+      ansible.builtin.shell: |
+        set -o pipefail
+        journalctl --since "{{ account_activity_window_days }} days ago" \
+          -u sshd -u systemd-logind -t sudo -t su -t sshd \
+          --output=short-iso 2>/dev/null | head -n 20000
+      args:
+        executable: /bin/bash
+      register: journal_auth_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_journalctl
+
+    - name: Collect auth.log or secure fallback
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -f /var/log/secure ]; then
+          tail -n 20000 /var/log/secure
+        elif [ -f /var/log/auth.log ]; then
+          tail -n 20000 /var/log/auth.log
+        else
+          true
+        fi
+      args:
+        executable: /bin/bash
+      register: authlog_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_authlog
+
+    - name: Collect auditd account-management entries
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -f /var/log/audit/audit.log ]; then
+          grep -E '(/etc/passwd|/etc/shadow|useradd|usermod|userdel|passwd|chage|faillock)' /var/log/audit/audit.log | tail -n 20000
+        else
+          true
+        fi
+      args:
+        executable: /bin/bash
+      register: auditd_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_auditd
+
+    - name: Collect authorized_keys metadata
+      ansible.builtin.shell: |
+        set -o pipefail
+        awk -F: '{print $1":"$6}' /etc/passwd | while IFS=: read -r u h; do
+          if [ -f "$h/.ssh/authorized_keys" ]; then
+            echo "$u|$h/.ssh/authorized_keys|$(wc -l < "$h/.ssh/authorized_keys")"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: authorized_keys_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Save raw payload on target
+      ansible.builtin.copy:
+        dest: "{{ account_activity_local_workdir }}/{{ inventory_hostname }}_account_activity_raw.json"
+        mode: "0600"
+        content: |
+          {
+            "hostname": {{ inventory_hostname | to_json }},
+            "host_group_csv": {{ (group_names | join(',')) | to_json }},
+            "ip_address": {{ ansible_default_ipv4.address | default(ansible_host | default('')) | to_json }},
+            "os_distro": {{ ansible_distribution | default('') | to_json }},
+            "os_version": {{ ansible_distribution_version | default('') | to_json }},
+            "hw_arch": {{ ansible_architecture | default('') | to_json }},
+            "host_time_text": {{ account_activity_collected_at_utc | to_json }},
+            "changed": false,
+            "unreachable": false,
+            "failed": false,
+            "window_days": {{ account_activity_window_days | int }},
+            "passwd": {{ getent_passwd_cmd.stdout_lines | default([]) | to_json }},
+            "group": {{ getent_group_cmd.stdout_lines | default([]) | to_json }},
+            "shadow": {{ shadow_cmd.stdout_lines | default([]) | to_json }},
+            "passwd_status": {{ passwd_status_cmd.results | default([]) | to_json }},
+            "chage": {{ chage_cmd.results | default([]) | to_json }},
+            "lastlog": {{ lastlog_cmd.results | default([]) | to_json }},
+            "faillock": {{ faillock_cmd.results | default([]) | to_json }},
+            "last": {{ last_cmd.stdout_lines | default([]) | to_json }},
+            "lastb": {{ lastb_cmd.stdout_lines | default([]) | to_json }},
+            "journal_auth": {{ journal_auth_cmd.stdout_lines | default([]) | to_json }},
+            "authlog": {{ authlog_cmd.stdout_lines | default([]) | to_json }},
+            "auditd": {{ auditd_cmd.stdout_lines | default([]) | to_json }},
+            "authorized_keys": {{ authorized_keys_cmd.stdout_lines | default([]) | to_json }}
+          }
+      no_log: true
+
+    - name: Fetch raw payload to controller
+      ansible.builtin.fetch:
+        src: "{{ account_activity_local_workdir }}/{{ inventory_hostname }}_account_activity_raw.json"
+        dest: "{{ account_activity_raw_dir }}/"
+        flat: true
+
+  post_tasks:
+    - name: Build consolidated client_account_activity_report.csv on controller
+      ansible.builtin.command: >-
+        python3 files/build_client_account_activity_report.py
+        --input-dir {{ account_activity_raw_dir }}
+        --output-file {{ account_activity_reports_dir }}/{{ account_activity_csv_name }}
+      delegate_to: "{{ account_activity_reports_host }}"
+      changed_when: false
+      run_once: true
