@@ -27,6 +27,7 @@
         mode: "0750"
 
     - name: Ensure reports directories exist on controller
+      become: false
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
@@ -228,6 +229,7 @@
 
   post_tasks:
     - name: Build consolidated client_account_activity_report.csv on controller
+      become: false
       ansible.builtin.command: >-
         python3 files/build_client_account_activity_report.py
         --input-dir {{ account_activity_raw_dir }}
