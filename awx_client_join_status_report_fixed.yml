@@ -8,6 +8,10 @@
     join_status_reports_host: "127.0.0.1"
     join_status_reports_dir: "/var/lib/awx/projects/reports"
     join_status_csv_name: "client_join_status_report.csv"
+    join_status_vastool_candidates:
+      - /opt/quest/bin/vastool
+      - /opt/quest/sbin/vastool
+      - /usr/bin/vastool
 
   pre_tasks:
     - name: Verify reports directory exists on controller
@@ -36,20 +40,31 @@
       failed_when: false
 
   tasks:
-    - name: Check whether vastool is available
-      ansible.builtin.shell: |
-        command -v vastool >/dev/null 2>&1
-      args:
-        executable: /bin/bash
-      register: vastool_exists_cmd
+    - name: Find vastool binary from known locations
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ join_status_vastool_candidates }}"
+      register: vastool_candidate_stats
       changed_when: false
-      failed_when: false
+
+    - name: Set chosen vastool path
+      ansible.builtin.set_fact:
+        join_status_vastool_bin: >-
+          {{
+            (
+              vastool_candidate_stats.results
+              | selectattr('stat.exists', 'equalto', true)
+              | map(attribute='stat.path')
+              | list
+              | first
+            ) | default('')
+          }}
 
     - name: Collect vastool status
       ansible.builtin.shell: |
         set -o pipefail
-        if command -v vastool >/dev/null 2>&1; then
-          vastool status 2>&1
+        if [ -x "{{ join_status_vastool_bin }}" ]; then
+          "{{ join_status_vastool_bin }}" status 2>&1
         else
           echo "vastool not installed"
           exit 127
@@ -63,8 +78,8 @@
     - name: Collect SAS version
       ansible.builtin.shell: |
         set -o pipefail
-        if command -v vastool >/dev/null 2>&1; then
-          vastool -v 2>/dev/null | head -n 1
+        if [ -x "{{ join_status_vastool_bin }}" ]; then
+          "{{ join_status_vastool_bin }}" -v 2>/dev/null | head -n 1
         else
           true
         fi
@@ -74,14 +89,14 @@
       changed_when: false
       failed_when: false
 
-    - name: Collect AD domain using available tools
+    - name: Collect AD domain using vastool or realm
       ansible.builtin.shell: |
         set -o pipefail
 
-        if command -v vastool >/dev/null 2>&1; then
+        if [ -x "{{ join_status_vastool_bin }}" ]; then
           (
-            vastool info domain 2>/dev/null || true
-            vastool status 2>/dev/null || true
+            "{{ join_status_vastool_bin }}" info domain 2>/dev/null || true
+            "{{ join_status_vastool_bin }}" status 2>/dev/null || true
           ) | awk -F': *' '
             /^[Dd]omain Name/ {print $2; exit}
             /^[Dd]omain/ {print $2; exit}
@@ -127,7 +142,7 @@
               | length
             ) > 0 else 'ungrouped'
           }}
-        join_status_ip_address: "{{ ansible_default_ipv4.address | default(ansible_host | default('')) }}"
+        join_status_ip_address: "{{ ansible_default_ipv4.address | default(ansible_all_ipv4_addresses[0] | default(ansible_host | default(''))) }}"
         join_status_sas_version: >-
           {{
             (sas_version_cmd.stdout | default('') | regex_search('([0-9]+(?:\.[0-9]+)+)', '\1') | first)
@@ -138,7 +153,7 @@
         join_status_failed: >-
           {{
             (
-              vastool_exists_cmd.rc | int != 0
+              join_status_vastool_bin | length == 0
               or vastool_status_cmd.rc | int != 0
               or (ad_domain_cmd.stdout | default('') | trim | length == 0)
             )
@@ -159,9 +174,9 @@
       delegate_to: "{{ join_status_reports_host }}"
       run_once: true
 
-    - name: Show generated report path
+    - name: Show generated report path and detected vastool
       ansible.builtin.debug:
         msg:
           - "Generated: {{ join_status_reports_dir }}/{{ join_status_csv_name }}"
-          - "Legacy JSON report removal attempted: {{ join_status_reports_dir }}/client_join_report.csv"
-      run_once: true
+          - "Detected vastool: {{ join_status_vastool_bin | default('') }}"
+      run_once: false
