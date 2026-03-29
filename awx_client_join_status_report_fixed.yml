@@ -1,0 +1,159 @@
+---
+- name: Generate flat client_join_status report for SQL-first importer
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    join_status_reports_host: "127.0.0.1"
+    join_status_reports_dir: "/var/lib/awx/projects/reports"
+    join_status_csv_name: "client_join_status_report.csv"
+
+  pre_tasks:
+    - name: Ensure reports directory exists on controller
+      become: false
+      ansible.builtin.file:
+        path: "{{ join_status_reports_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: "{{ join_status_reports_host }}"
+      run_once: true
+
+    - name: Remove legacy JSON-style client_join_report.csv from controller
+      become: false
+      ansible.builtin.file:
+        path: "{{ join_status_reports_dir }}/client_join_report.csv"
+        state: absent
+      delegate_to: "{{ join_status_reports_host }}"
+      run_once: true
+
+  tasks:
+    - name: Check whether vastool is available
+      ansible.builtin.shell: |
+        command -v vastool >/dev/null 2>&1
+      args:
+        executable: /bin/bash
+      register: vastool_exists_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Collect vastool status
+      ansible.builtin.shell: |
+        set -o pipefail
+        if command -v vastool >/dev/null 2>&1; then
+          vastool status 2>&1
+        else
+          echo "vastool not installed"
+          exit 127
+        fi
+      args:
+        executable: /bin/bash
+      register: vastool_status_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Collect SAS version
+      ansible.builtin.shell: |
+        set -o pipefail
+        if command -v vastool >/dev/null 2>&1; then
+          vastool -v 2>/dev/null | head -n 1
+        else
+          true
+        fi
+      args:
+        executable: /bin/bash
+      register: sas_version_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Collect AD domain using available tools
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        if command -v vastool >/dev/null 2>&1; then
+          (
+            vastool info domain 2>/dev/null || true
+            vastool status 2>/dev/null || true
+          ) | awk -F': *' '
+            /^[Dd]omain Name/ {print $2; exit}
+            /^[Dd]omain/ {print $2; exit}
+            /joined to domain/ {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "domain") { print $(i+1); exit }
+              }
+            }
+          '
+          exit 0
+        fi
+
+        if command -v realm >/dev/null 2>&1; then
+          realm list 2>/dev/null | awk -F': *' '
+            /^[[:space:]]*domain-name:/ {print $2; exit}
+            /^[[:space:]]*realm-name:/ {print $2; exit}
+          '
+          exit 0
+        fi
+
+        true
+      args:
+        executable: /bin/bash
+      register: ad_domain_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Derive join status report values
+      ansible.builtin.set_fact:
+        join_status_group_csv: >-
+          {{
+            (
+              group_names
+              | reject('equalto', 'all')
+              | reject('equalto', 'ungrouped')
+              | list
+              | join('|')
+            ) if (
+              group_names
+              | reject('equalto', 'all')
+              | reject('equalto', 'ungrouped')
+              | list
+              | length
+            ) > 0 else 'ungrouped'
+          }}
+        join_status_ip_address: "{{ ansible_default_ipv4.address | default(ansible_host | default('')) }}"
+        join_status_sas_version: >-
+          {{
+            (sas_version_cmd.stdout | default('') | regex_search('([0-9]+(?:\.[0-9]+)+)', '\1') | first)
+            if (sas_version_cmd.stdout | default('') | length > 0)
+            else ''
+          }}
+        join_status_ad_domain: "{{ ad_domain_cmd.stdout | default('') | trim }}"
+        join_status_failed: >-
+          {{
+            (
+              vastool_exists_cmd.rc | int != 0
+              or vastool_status_cmd.rc | int != 0
+              or (ad_domain_cmd.stdout | default('') | trim | length == 0)
+            )
+          }}
+        join_status_unreachable: false
+
+  post_tasks:
+    - name: Build flat client_join_status_report.csv on controller
+      become: false
+      ansible.builtin.copy:
+        dest: "{{ join_status_reports_dir }}/{{ join_status_csv_name }}"
+        mode: "0640"
+        content: |
+          hostname,group,ip_address,os_distro,os_version,sas_version,ad_domain,unreachable,failed
+          {% for h in ansible_play_hosts_all | sort %}
+          {{ hostvars[h].inventory_hostname | default('') | replace(',', ' ') }},{{ hostvars[h].join_status_group_csv | default('ungrouped') | replace(',', '|') }},{{ hostvars[h].join_status_ip_address | default('') | replace(',', ' ') }},{{ hostvars[h].ansible_distribution | default('') | replace(',', ' ') }},{{ hostvars[h].ansible_distribution_version | default('') | replace(',', ' ') }},{{ hostvars[h].join_status_sas_version | default('') | replace(',', ' ') }},{{ hostvars[h].join_status_ad_domain | default('') | replace(',', ' ') }},{{ hostvars[h].join_status_unreachable | default(false) }},{{ hostvars[h].join_status_failed | default(true) }}
+          {% endfor %}
+      delegate_to: "{{ join_status_reports_host }}"
+      run_once: true
+
+    - name: Show generated report path
+      ansible.builtin.debug:
+        msg:
+          - "Generated: {{ join_status_reports_dir }}/{{ join_status_csv_name }}"
+          - "Legacy JSON report removed: {{ join_status_reports_dir }}/client_join_report.csv"
+      run_once: true
