@@ -10,22 +10,30 @@
     join_status_csv_name: "client_join_status_report.csv"
 
   pre_tasks:
-    - name: Ensure reports directory exists on controller
+    - name: Verify reports directory exists on controller
       become: false
-      ansible.builtin.file:
+      ansible.builtin.stat:
         path: "{{ join_status_reports_dir }}"
-        state: directory
-        mode: "0750"
+      register: join_reports_dir_stat
       delegate_to: "{{ join_status_reports_host }}"
       run_once: true
 
-    - name: Remove legacy JSON-style client_join_report.csv from controller
+    - name: Stop if reports directory is missing on controller
+      become: false
+      ansible.builtin.fail:
+        msg: "Directory {{ join_status_reports_dir }} does not exist on controller. Create it once outside this playbook."
+      when: not join_reports_dir_stat.stat.exists
+      delegate_to: "{{ join_status_reports_host }}"
+      run_once: true
+
+    - name: Try to remove legacy JSON-style client_join_report.csv from controller
       become: false
       ansible.builtin.file:
         path: "{{ join_status_reports_dir }}/client_join_report.csv"
         state: absent
       delegate_to: "{{ join_status_reports_host }}"
       run_once: true
+      failed_when: false
 
   tasks:
     - name: Check whether vastool is available
@@ -155,5 +163,5 @@
       ansible.builtin.debug:
         msg:
           - "Generated: {{ join_status_reports_dir }}/{{ join_status_csv_name }}"
-          - "Legacy JSON report removed: {{ join_status_reports_dir }}/client_join_report.csv"
+          - "Legacy JSON report removal attempted: {{ join_status_reports_dir }}/client_join_report.csv"
       run_once: true
