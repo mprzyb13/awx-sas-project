@@ -197,7 +197,7 @@ def parse_chage(results: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def parse_authorized_keys(lines: Iterable[str]) -> dict[str, int]:
     out: dict[str, int] = {}
-    for line in lines or []:
+    for line in _iter_text_lines(lines):
         parts = line.split("|")
         if len(parts) >= 3:
             out[parts[0]] = _to_int(parts[2]) or 0
@@ -209,8 +209,26 @@ def parse_faillock(results: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any
     for rec in results or []:
         user = rec.get("item")
         lines = rec.get("stdout_lines") or []
-        count = sum(1 for line in lines if line.strip() and not line.lower().startswith("when") and not line.lower().startswith("user"))
+        count = sum(1 for line in lines if isinstance(line, str) and line.strip() and not line.lower().startswith("when") and not line.lower().startswith("user"))
         out[user] = {"faillock_count": count, "faillock_locked_flag": count > 0}
+    return out
+
+
+def _iter_text_lines(value: Any, *, skip_first: int = 0) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    elif isinstance(value, tuple):
+        items = list(value)
+    else:
+        return []
+    out: list[str] = []
+    for item in items[skip_first:]:
+        if isinstance(item, str):
+            out.append(item)
     return out
 
 
@@ -224,7 +242,7 @@ def parse_events(raw: dict[str, Any], collected_at: datetime) -> dict[str, list[
 
     # First pass over raw auth/journal logs where timestamps are explicit.
     for field in ["journal_auth", "authlog"]:
-        for line in raw.get(field, []) or []:
+        for line in _iter_text_lines(raw.get(field)):
             ts, remainder = parse_syslog_prefix(line, collected_at)
             if ts is None:
                 continue
@@ -244,7 +262,7 @@ def parse_events(raw: dict[str, Any], collected_at: datetime) -> dict[str, list[
 
     # Normalized auth/journal evidence created by collector v2.
     for field in ["authlog_normalized", "journal_normalized"]:
-        for line in raw.get(field, []) or []:
+        for line in _iter_text_lines(raw.get(field)):
             if not isinstance(line, str) or "|" not in line:
                 continue
             prefix, rest = line.split("|", 1)
@@ -271,7 +289,7 @@ def parse_events(raw: dict[str, Any], collected_at: datetime) -> dict[str, list[
 
     # last/lastb normalized evidence if available.
     for field, kind in [("last_normalized", "success_login"), ("lastb_normalized", "failed_login")]:
-        for line in raw.get(field, []) or []:
+        for line in _iter_text_lines(raw.get(field)):
             if not isinstance(line, str):
                 continue
             parts = line.split("|", 4)
@@ -282,7 +300,7 @@ def parse_events(raw: dict[str, Any], collected_at: datetime) -> dict[str, list[
             add(user, ts, kind, source_type.strip().upper(), ipv4_or_empty(src) or None, rawline)
 
     # who / w live session hints (best effort)
-    for line in raw.get("who", []) or []:
+    for line in _iter_text_lines(raw.get("who")):
         m = WHO_RE.match(line.strip())
         if not m:
             continue
@@ -291,7 +309,7 @@ def parse_events(raw: dict[str, Any], collected_at: datetime) -> dict[str, list[
         ts = _parse_who_datetime(m.group("date"), m.group("time"), collected_at)
         add(user, ts, "live_session", source_type, ipv4_or_empty(m.group("src") or "") or None, line)
 
-    for line in raw.get("w", []) or [][2:]:
+    for line in _iter_text_lines(raw.get("w"), skip_first=2):
         m = W_SESSION_RE.match(line.strip())
         if not m:
             continue
