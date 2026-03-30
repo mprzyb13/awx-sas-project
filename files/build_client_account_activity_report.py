@@ -6,461 +6,533 @@ import csv
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable
 
-CSV_HEADER = [
-    "hostname",
-    "group",
-    "ip_address",
-    "os_distro",
-    "os_version",
-    "hw_arch",
-    "time",
-    "changed",
-    "unreachable",
-    "failed",
-    "details",
-]
+REPORT_TYPE = "client_account_activity"
+COLLECTOR_VERSION = "2.0.0"
 
-INTERACTIVE_SHELL_MARKERS = ("/sh", "/bash", "/zsh", "/ksh", "/csh", "/fish")
-MONTHS = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
-PASSWD_STATUS_MAP = {
-    "P": (False, False),
-    "PS": (False, False),
-    "NP": (False, False),
-    "L": (True, True),
-    "LK": (True, True),
+MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
-
-def parse_bool(v: Any) -> bool:
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def iso_or_none(dt: Optional[datetime]) -> Optional[str]:
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") if dt else None
-
-
-def date_or_none(dt: Optional[datetime]) -> Optional[str]:
-    return dt.strftime("%Y-%m-%d") if dt else None
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+ACCEPTED_RE = re.compile(r"Accepted (?:password|publickey) for (?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
+FAILED_RE = re.compile(r"Failed (?:password|publickey) for (?:invalid user )?(?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)")
+SESSION_OPEN_RE = re.compile(r"pam_unix\((?P<svc>sshd|login):session\): session opened for user (?P<user>[^\s(]+)")
+SUDO_RE = re.compile(r"sudo: (?P<user>[^ :]+) : TTY=(?P<tty>[^ ;]+)")
+WHO_RE = re.compile(r"^(?P<user>\S+)\s+(?P<tty>\S+)\s+(?P<date>\d{4}-\d{2}-\d{2}|[A-Z][a-z]{2}\s+\d{1,2})\s+(?P<time>\d{2}:\d{2})(?:\s+\((?P<src>[^)]+)\))?")
+W_SESSION_RE = re.compile(r"^(?P<user>\S+)\s+(?P<tty>\S+)\s+(?P<src>\S+)\s+(?P<login>\d{2}:\d{2})")
+PASSWD_STATUS_RE = re.compile(r"^(?P<user>\S+)\s+(?P<code>[A-Z]{1,3})\b")
 
 
-def epoch_days_to_date(text: str) -> Optional[datetime]:
-    if not text or not str(text).isdigit():
+@dataclass
+class Event:
+    ts: datetime
+    kind: str
+    source_type: str
+    ip: str | None
+    line: str
+
+
+# -------- basic helpers --------
+
+def json_load(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
         return None
-    return datetime(1970, 1, 1) + timedelta(days=int(text))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def normalize_result_map(results: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for item in results or []:
-        cmd = str(item.get("cmd") or "")
-        parts = cmd.split()
-        user = parts[-1] if parts else None
-        if user:
-            out[user] = item
-    return out
+def parse_isoish(ts: str) -> datetime | None:
+    ts = ts.strip()
+    if not ts:
+        return None
+    normalized = ts.replace("Z", "+00:00")
+    if re.search(r"[+-]\d{4}$", normalized):
+        normalized = normalized[:-5] + normalized[-5:-2] + ":" + normalized[-2:]
+    try:
+        return ensure_utc(datetime.fromisoformat(normalized))
+    except Exception:
+        return None
 
 
-def parse_passwd(lines: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for line in lines or []:
-        parts = str(line).rstrip("\n").split(":")
+def parse_syslog_prefix(line: str, collected_at: datetime) -> tuple[datetime | None, str]:
+    line = line.rstrip()
+    if not line:
+        return None, line
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T[^ ]+)\s+(.*)$", line)
+    if m:
+        return parse_isoish(m.group(1)), m.group(2)
+
+    m = re.match(r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(.*)$", line)
+    if m:
+        month = MONTHS.get(m.group(1))
+        if month:
+            day = int(m.group(2))
+            hh, mm, ss = map(int, m.group(3).split(":"))
+            dt = datetime(collected_at.year, month, day, hh, mm, ss, tzinfo=timezone.utc)
+            # guard against Dec->Jan around year boundaries
+            if dt - collected_at > timedelta(days=30):
+                dt = dt.replace(year=dt.year - 1)
+            elif collected_at - dt > timedelta(days=335):
+                dt = dt.replace(year=dt.year + 1)
+            return dt, m.group(4)
+
+    return None, line
+
+
+def dt_text(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return ensure_utc(dt).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def is_interactive_shell(shell: str | None) -> bool:
+    shell = (shell or "").strip().lower()
+    if not shell:
+        return False
+    bad = ["nologin", "/bin/false", "/sbin/halt", "/sbin/shutdown", "/bin/sync"]
+    return not any(token in shell for token in bad)
+
+
+def ipv4_or_empty(value: str | None) -> str:
+    value = (value or "").strip()
+    if IPV4_RE.fullmatch(value):
+        return value
+    return ""
+
+
+def first_non_loopback_ipv4(*values: str) -> str:
+    for value in values:
+        if not value:
+            continue
+        for match in IPV4_RE.findall(value):
+            if match != "127.0.0.1":
+                return match
+    return ""
+
+
+# -------- parsers --------
+
+def parse_passwd_rows(rows: Iterable[str]) -> dict[str, dict[str, Any]]:
+    users: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        parts = row.split(":")
         if len(parts) < 7:
             continue
-        user, _, uid, gid, gecos, home, shell = parts[:7]
-        out[user] = {
+        user = parts[0]
+        if user in users:
+            continue  # prefer first occurrence (usually local over alt mapping)
+        users[user] = {
             "user_name": user,
-            "uid_number": int(uid) if uid.isdigit() else None,
-            "gid_number": int(gid) if gid.isdigit() else None,
-            "gecos": gecos or None,
-            "home_dir": home or None,
-            "login_shell": shell or None,
-            "shell_is_interactive_flag": bool(shell and any(shell.endswith(m) for m in INTERACTIVE_SHELL_MARKERS)),
+            "uid_number": _to_int(parts[2]),
+            "gid_number": _to_int(parts[3]),
+            "gecos": parts[4] or None,
+            "home_dir": parts[5] or None,
+            "login_shell": parts[6] or None,
+            "shell_is_interactive_flag": is_interactive_shell(parts[6]),
         }
-    return out
+    return users
 
 
-def parse_shadow(lines: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for line in lines or []:
-        parts = str(line).rstrip("\n").split(":")
-        if len(parts) < 9:
-            continue
-        user, pwd, lastchg, mindays, maxdays, warn, inactive, expire, _ = parts[:9]
-        out[user] = {
-            "password_hash_present_flag": bool(pwd and pwd not in {"!", "*", "!!", "x"}),
-            "password_locked_flag": pwd.startswith("!") or pwd.startswith("*"),
-            "password_last_change_date": date_or_none(epoch_days_to_date(lastchg)),
-            "password_min_days": int(mindays) if str(mindays).isdigit() else None,
-            "password_max_days": int(maxdays) if str(maxdays).isdigit() else None,
-            "password_warn_days": int(warn) if str(warn).isdigit() else None,
-            "password_inactive_days": int(inactive) if str(inactive).isdigit() else None,
-            "account_expire_date": date_or_none(epoch_days_to_date(expire)),
-        }
-        if out[user]["password_last_change_date"] and out[user]["password_max_days"] is not None:
-            base = datetime.strptime(out[user]["password_last_change_date"], "%Y-%m-%d")
-            out[user]["password_expire_date"] = date_or_none(base + timedelta(days=out[user]["password_max_days"]))
-        else:
-            out[user]["password_expire_date"] = None
-    return out
-
-
-def parse_passwd_status(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for user, item in results.items():
-        stdout = str(item.get("stdout") or "").strip()
-        if not stdout:
-            continue
-        parts = stdout.split()
+def parse_shadow_rows(rows: Iterable[str]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        parts = row.split(":")
         if len(parts) < 2:
             continue
-        status = parts[1].upper()
-        password_locked_flag, account_locked_flag = PASSWD_STATUS_MAP.get(status, (False, False))
-        out[user] = {
-            "passwd_status_code": status,
-            "password_locked_flag": password_locked_flag,
-            "account_locked_flag": account_locked_flag,
-            "passwd_status_raw": stdout,
+        user = parts[0]
+        result[user] = {
+            "password_hash": parts[1],
+            "shadow_last_change_days": _to_int(parts[2]) if len(parts) > 2 else None,
+            "shadow_min_days": _to_int(parts[3]) if len(parts) > 3 else None,
+            "shadow_max_days": _to_int(parts[4]) if len(parts) > 4 else None,
+            "shadow_warn_days": _to_int(parts[5]) if len(parts) > 5 else None,
+            "shadow_inactive_days": _to_int(parts[6]) if len(parts) > 6 else None,
+            "shadow_expire_days": _to_int(parts[7]) if len(parts) > 7 else None,
         }
+    return result
+
+
+def parse_passwd_status(results: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for rec in results or []:
+        user = rec.get("item")
+        stdout = (rec.get("stdout") or "").strip()
+        if not user:
+            continue
+        m = PASSWD_STATUS_RE.match(stdout)
+        code = None
+        if m and m.group("user") == user:
+            code = m.group("code")
+        out[user] = {"passwd_status_code": code, "raw": stdout or None, "rc": rec.get("rc")}
     return out
 
 
-def parse_chage(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for user, item in results.items():
-        stdout = str(item.get("stdout") or "")
-        if not stdout:
+def parse_chage(results: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for rec in results or []:
+        user = rec.get("item")
+        if not user:
             continue
-        data: Dict[str, Any] = {}
-        for line in stdout.splitlines():
+        parsed: dict[str, Any] = {}
+        for line in rec.get("stdout_lines") or []:
             if ":" not in line:
                 continue
-            k, v = line.split(":", 1)
-            key = k.strip().lower()
-            val = v.strip()
-            if key == "last password change":
-                data["password_last_change_text"] = val
-            elif key == "password expires":
-                data["password_expires_text"] = val
-            elif key == "password inactive":
-                data["password_inactive_text"] = val
-            elif key == "account expires":
-                data["account_expires_text"] = val
-            elif key == "minimum number of days between password change":
-                data["password_min_days"] = int(val) if val.isdigit() else data.get("password_min_days")
-            elif key == "maximum number of days between password change":
-                data["password_max_days"] = int(val) if val.isdigit() else data.get("password_max_days")
-            elif key == "number of days of warning before password expires":
-                data["password_warn_days"] = int(val) if val.isdigit() else data.get("password_warn_days")
-        out[user] = data
+            key, value = [x.strip() for x in line.split(":", 1)]
+            parsed[key] = value
+        out[user] = parsed
     return out
 
 
-def parse_lastlog(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for user, item in results.items():
-        lines = [ln for ln in str(item.get("stdout") or "").splitlines() if ln.strip()]
-        if len(lines) < 2:
-            continue
-        line = lines[1].strip()
-        if "**Never logged in**" in line:
-            out[user] = {
-                "last_login_at_utc": None,
-                "last_login_source_ip": None,
-                "last_login_tty": None,
-                "never_logged_in_flag": True,
-            }
-            continue
-        # user pts/0 192.168.1.10 Sat Mar 28 09:55:10 +0000 2026
-        m = re.match(r"^(?P<user>\S+)\s+(?P<tty>\S+)\s+(?P<src>\S+)\s+(?P<dt>.+)$", line)
-        if not m:
-            continue
-        dt = parse_generic_date(m.group("dt"))
-        out[user] = {
-            "last_login_at_utc": iso_or_none(dt),
-            "last_login_source_ip": m.group("src") if m.group("src") not in {"**Never", "in**"} else None,
-            "last_login_tty": m.group("tty"),
-            "never_logged_in_flag": False,
-        }
-    return out
-
-
-def parse_generic_date(text: str) -> Optional[datetime]:
-    text = str(text).strip()
-    fmts = [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%a %b %d %H:%M:%S %z %Y",
-        "%a %b %d %H:%M:%S %Y",
-        "%b %d %H:%M:%S %Y",
-    ]
-    for fmt in fmts:
-        try:
-            dt = datetime.strptime(text, fmt)
-            if dt.tzinfo:
-                return dt.replace(tzinfo=None)
-            return dt
-        except ValueError:
-            continue
-    return None
-
-
-def parse_last_lines(lines: Iterable[str], success: bool) -> Dict[str, Dict[str, Any]]:
-    if success:
-        counts: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
-            "successful_login_count_7d": 0,
-            "successful_login_count_30d": 0,
-            "successful_login_count_90d": 0,
-            "distinct_ips_30d": set(),
-            "distinct_ips_90d": set(),
-            "last_success_login_at_utc": None,
-            "last_success_login_ip": None,
-        })
-    else:
-        counts = defaultdict(lambda: {
-            "failed_login_count_7d": 0,
-            "failed_login_count_30d": 0,
-            "failed_login_count_90d": 0,
-            "distinct_ips_30d": set(),
-            "distinct_ips_90d": set(),
-            "last_failed_login_at_utc": None,
-            "last_failed_login_ip": None,
-        })
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    line_re = re.compile(r"^(?P<user>\S+)\s+(?P<tty>\S+)\s+(?P<src>\S+)\s+(?P<dt1>[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\d{4})")
+def parse_authorized_keys(lines: Iterable[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
     for line in lines or []:
-        text = str(line).strip()
-        if not text or text.startswith(("wtmp begins", "btmp begins", "reboot", "shutdown")):
-            continue
-        m = line_re.match(text)
+        parts = line.split("|")
+        if len(parts) >= 3:
+            out[parts[0]] = _to_int(parts[2]) or 0
+    return out
+
+
+def parse_faillock(results: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for rec in results or []:
+        user = rec.get("item")
+        lines = rec.get("stdout_lines") or []
+        count = sum(1 for line in lines if line.strip() and not line.lower().startswith("when") and not line.lower().startswith("user"))
+        out[user] = {"faillock_count": count, "faillock_locked_flag": count > 0}
+    return out
+
+
+def parse_events(raw: dict[str, Any], collected_at: datetime) -> dict[str, list[Event]]:
+    events: dict[str, list[Event]] = defaultdict(list)
+
+    def add(user: str, ts: datetime | None, kind: str, source_type: str, ip: str | None, line: str) -> None:
+        if not user or ts is None:
+            return
+        events[user].append(Event(ensure_utc(ts), kind, source_type, ip, line))
+
+    # First pass over raw auth/journal logs where timestamps are explicit.
+    for field in ["journal_auth", "authlog"]:
+        for line in raw.get(field, []) or []:
+            ts, remainder = parse_syslog_prefix(line, collected_at)
+            if ts is None:
+                continue
+
+            m = ACCEPTED_RE.search(remainder)
+            if m:
+                add(m.group("user"), ts, "success_login", "SSH", m.group("ip"), line)
+
+            m = SESSION_OPEN_RE.search(remainder)
+            if m:
+                source_type = "SSH" if m.group("svc") == "sshd" else "CONSOLE"
+                add(m.group("user"), ts, "success_login", source_type, None, line)
+
+            m = FAILED_RE.search(remainder)
+            if m:
+                add(m.group("user"), ts, "failed_login", "SSH", m.group("ip"), line)
+
+    # Normalized auth/journal evidence created by collector v2.
+    for field in ["authlog_normalized", "journal_normalized"]:
+        for line in raw.get(field, []) or []:
+            if not isinstance(line, str) or "|" not in line:
+                continue
+            prefix, rest = line.split("|", 1)
+            ts, remainder = parse_syslog_prefix(rest, collected_at)
+            if ts is None:
+                continue
+            source_type = "SSH" if prefix.strip().upper().startswith("SSH") else "CONSOLE"
+
+            m = SESSION_OPEN_RE.search(remainder)
+            if m:
+                add(m.group("user"), ts, "success_login", source_type, None, line)
+                continue
+            m = ACCEPTED_RE.search(remainder)
+            if m:
+                add(m.group("user"), ts, "success_login", source_type, m.group("ip"), line)
+                continue
+            m = FAILED_RE.search(remainder)
+            if m:
+                add(m.group("user"), ts, "failed_login", source_type, m.group("ip"), line)
+                continue
+            m = re.search(r"user (?P<user>[^\s(]+)", remainder)
+            if m:
+                add(m.group("user"), ts, "session_activity", source_type, None, line)
+
+    # last/lastb normalized evidence if available.
+    for field, kind in [("last_normalized", "success_login"), ("lastb_normalized", "failed_login")]:
+        for line in raw.get(field, []) or []:
+            if not isinstance(line, str):
+                continue
+            parts = line.split("|", 4)
+            if len(parts) < 5:
+                continue
+            source_type, user, _term, src, rawline = parts
+            ts = _parse_last_timestamp(rawline, collected_at)
+            add(user, ts, kind, source_type.strip().upper(), ipv4_or_empty(src) or None, rawline)
+
+    # who / w live session hints (best effort)
+    for line in raw.get("who", []) or []:
+        m = WHO_RE.match(line.strip())
         if not m:
             continue
         user = m.group("user")
-        src = None if m.group("src") in {"0.0.0.0", ":0", "(none)"} else m.group("src")
-        dt = parse_generic_date(m.group("dt1"))
-        if not dt:
+        source_type = "SSH" if m.group("tty").startswith("pts/") else "CONSOLE"
+        ts = _parse_who_datetime(m.group("date"), m.group("time"), collected_at)
+        add(user, ts, "live_session", source_type, ipv4_or_empty(m.group("src") or "") or None, line)
+
+    for line in raw.get("w", []) or [][2:]:
+        m = W_SESSION_RE.match(line.strip())
+        if not m:
             continue
-        age_days = (now - dt).days
-        bucket = counts[user]
-        if success:
-            if bucket["last_success_login_at_utc"] is None or dt > datetime.strptime(bucket["last_success_login_at_utc"], "%Y-%m-%dT%H:%M:%S"):
-                bucket["last_success_login_at_utc"] = iso_or_none(dt)
-                bucket["last_success_login_ip"] = src
-            if age_days <= 7:
-                bucket["successful_login_count_7d"] += 1
-            if age_days <= 30:
-                bucket["successful_login_count_30d"] += 1
-                if src:
-                    bucket["distinct_ips_30d"].add(src)
-            if age_days <= 90:
-                bucket["successful_login_count_90d"] += 1
-                if src:
-                    bucket["distinct_ips_90d"].add(src)
-        else:
-            if bucket["last_failed_login_at_utc"] is None or dt > datetime.strptime(bucket["last_failed_login_at_utc"], "%Y-%m-%dT%H:%M:%S"):
-                bucket["last_failed_login_at_utc"] = iso_or_none(dt)
-                bucket["last_failed_login_ip"] = src
-            if age_days <= 7:
-                bucket["failed_login_count_7d"] += 1
-            if age_days <= 30:
-                bucket["failed_login_count_30d"] += 1
-                if src:
-                    bucket["distinct_ips_30d"].add(src)
-            if age_days <= 90:
-                bucket["failed_login_count_90d"] += 1
-                if src:
-                    bucket["distinct_ips_90d"].add(src)
-    out = {}
-    for user, bucket in counts.items():
-        bucket["distinct_source_ip_count_30d"] = len(bucket.pop("distinct_ips_30d"))
-        bucket["distinct_source_ip_count_90d"] = len(bucket.pop("distinct_ips_90d"))
-        out[user] = dict(bucket)
-    return out
+        user = m.group("user")
+        source_type = "SSH" if m.group("tty").startswith("pts/") else "CONSOLE"
+        ts = _today_at(m.group("login"), collected_at)
+        src = m.group("src") if IPV4_RE.fullmatch(m.group("src") or "") else None
+        add(user, ts, "live_session", source_type, src, line)
+
+    for user in list(events):
+        events[user].sort(key=lambda e: e.ts)
+    return events
 
 
-def parse_faillock(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for user, item in results.items():
-        stdout = str(item.get("stdout") or "")
-        lines = [ln for ln in stdout.splitlines() if ln.strip()]
-        out[user] = {
-            "faillock_count": max(0, len(lines) - 1) if lines else 0,
-            "faillock_locked_flag": bool(lines and len(lines) > 1),
-        }
-    return out
+def _parse_last_timestamp(rawline: str, collected_at: datetime) -> datetime | None:
+    # Example: user pts/0 192.168.0.1 Fri Mar 27 22:31:50 2026 - Fri Mar ...
+    m = re.search(r"([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})", rawline)
+    if m:
+        try:
+            return ensure_utc(datetime.strptime(m.group(1), "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc))
+        except Exception:
+            return None
+    return None
 
 
-def parse_authorized_keys(lines: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for line in lines or []:
-        parts = str(line).split("|")
-        if len(parts) != 3:
-            continue
-        user, path, count = parts
-        out[user] = {
-            "ssh_authorized_keys_count": int(count) if count.isdigit() else 0,
-            "ssh_authorized_keys_path": path,
-        }
-    return out
+def _parse_who_datetime(date_text: str, time_text: str, collected_at: datetime) -> datetime | None:
+    if re.match(r"\d{4}-\d{2}-\d{2}$", date_text):
+        return parse_isoish(f"{date_text}T{time_text}:00+00:00")
+    m = re.match(r"([A-Z][a-z]{2})\s+(\d{1,2})$", date_text)
+    if m:
+        month = MONTHS.get(m.group(1))
+        if month:
+            dt = datetime(collected_at.year, month, int(m.group(2)), int(time_text[:2]), int(time_text[3:]), 0, tzinfo=timezone.utc)
+            if dt > collected_at + timedelta(days=1):
+                dt = dt.replace(year=dt.year - 1)
+            return dt
+    return None
 
 
-def collect_events(user: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    events: List[Dict[str, Any]] = []
-    regexes = [
-        (payload.get("authlog") or [], re.compile(r"^(?P<ts>\w{3}\s+\d+\s+\d+:\d+:\d+).*Accepted .* for (?P<user>\S+) from (?P<ip>\S+) .*ssh2"), "LOGIN_SUCCESS", "SUCCESS", "AUTHLOG"),
-        (payload.get("authlog") or [], re.compile(r"^(?P<ts>\w{3}\s+\d+\s+\d+:\d+:\d+).*Failed .* for (invalid user )?(?P<user>\S+) from (?P<ip>\S+) .*ssh2"), "LOGIN_FAILURE", "FAILED", "AUTHLOG"),
-        (payload.get("journal_auth") or [], re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}).*Accepted .* for (?P<user>\S+) from (?P<ip>\S+) .*ssh2"), "LOGIN_SUCCESS", "SUCCESS", "JOURNALCTL"),
-        (payload.get("journal_auth") or [], re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}).*Failed .* for (invalid user )?(?P<user>\S+) from (?P<ip>\S+) .*ssh2"), "LOGIN_FAILURE", "FAILED", "JOURNALCTL"),
+def _today_at(hhmm: str, collected_at: datetime) -> datetime | None:
+    if not re.match(r"\d{2}:\d{2}$", hhmm):
+        return None
+    dt = collected_at.replace(hour=int(hhmm[:2]), minute=int(hhmm[3:]), second=0, microsecond=0)
+    if dt > collected_at + timedelta(hours=1):
+        dt -= timedelta(days=1)
+    return dt
+
+
+# -------- row builder --------
+
+def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
+    collected_at = parse_isoish(raw.get("host_time_text") or "") or datetime.now(timezone.utc)
+    users = parse_passwd_rows(raw.get("passwd") or [])
+    shadow = parse_shadow_rows(raw.get("shadow") or [])
+    passwd_status = parse_passwd_status(raw.get("passwd_status") or [])
+    chage = parse_chage(raw.get("chage") or [])
+    authkeys = parse_authorized_keys(raw.get("authorized_keys") or [])
+    faillock = parse_faillock(raw.get("faillock") or [])
+    events = parse_events(raw, collected_at)
+
+    user_rows = []
+    source_files = [
+        "/etc/passwd",
+        "/etc/shadow",
+        "/var/log/auth.log",
+        "/var/log/secure",
+        "/var/log/audit/audit.log",
     ]
-    current_year = datetime.now(timezone.utc).year
-    for lines, rgx, etype, result, source in regexes:
-        for raw in lines:
-            m = rgx.search(str(raw))
-            if not m or m.group("user") != user:
-                continue
-            ts = m.group("ts")
-            dt = parse_generic_date(ts if ts.startswith("20") else f"{ts} {current_year}")
-            events.append({
-                "event_time_utc": iso_or_none(dt),
-                "event_type_code": etype,
-                "event_result_code": result,
-                "source_ip": m.group("ip"),
-                "source_port": None,
-                "tty_name": None,
-                "session_id": None,
-                "process_name": "sshd",
-                "process_id": None,
-                "service_name": "sshd",
-                "auth_mechanism": "password",
-                "actor_username": None,
-                "actor_uid": None,
-                "raw_source": source,
-                "raw_message": str(raw),
-                "confidence_code": "HIGH",
-            })
-    return sorted(events, key=lambda x: (x.get("event_time_utc") or "", x.get("event_type_code") or ""), reverse=True)[:50]
 
+    for user_name, base in sorted(users.items()):
+        s = shadow.get(user_name, {})
+        ps = passwd_status.get(user_name, {})
+        ch = chage.get(user_name, {})
+        fl = faillock.get(user_name, {"faillock_count": 0, "faillock_locked_flag": False})
+        ev = events.get(user_name, [])
 
-def parse_auditd_created_disabled(user: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    created_at = None
-    disabled_at = None
-    for raw in payload.get("auditd") or []:
-        text = str(raw)
-        if user in text and ("useradd" in text or "/etc/passwd" in text):
-            created_at = created_at or text
-        if user in text and ("usermod" in text or "passwd" in text or "chage" in text):
-            if "lock" in text.lower() or "expire" in text.lower() or "disable" in text.lower():
-                disabled_at = disabled_at or text
-    return {
-        "account_created_source": "AUDITD" if created_at else None,
-        "account_created_at_best_effort_utc": None,
-        "account_disabled_source": "AUDITD" if disabled_at else None,
-        "account_disabled_at_best_effort_utc": None,
-    }
+        success = [e for e in ev if e.kind in {"success_login", "live_session"}]
+        failed = [e for e in ev if e.kind == "failed_login"]
 
+        last_success = success[-1] if success else None
+        last_failed = failed[-1] if failed else None
 
-def build_report_row(payload: Dict[str, Any]) -> Dict[str, Any]:
-    passwd = parse_passwd(payload.get("passwd") or [])
-    shadow = parse_shadow(payload.get("shadow") or [])
-    passwd_status = parse_passwd_status(normalize_result_map(payload.get("passwd_status") or []))
-    chage = parse_chage(normalize_result_map(payload.get("chage") or []))
-    lastlog = parse_lastlog(normalize_result_map(payload.get("lastlog") or []))
-    success = parse_last_lines(payload.get("last") or [], success=True)
-    failure = parse_last_lines(payload.get("lastb") or [], success=False)
-    faillock = parse_faillock(normalize_result_map(payload.get("faillock") or []))
-    authkeys = parse_authorized_keys(payload.get("authorized_keys") or [])
+        ips30 = {e.ip for e in success if e.ip and e.ts >= collected_at - timedelta(days=30)}
+        ips90 = {e.ip for e in success if e.ip and e.ts >= collected_at - timedelta(days=90)}
 
-    users = []
-    user_names = sorted(passwd.keys())
-    for user in user_names:
-        row: Dict[str, Any] = {}
-        row.update(passwd.get(user, {}))
-        row.update(shadow.get(user, {}))
-        row.update(chage.get(user, {}))
-        row.update(lastlog.get(user, {}))
-        row.update(success.get(user, {}))
-        row.update(failure.get(user, {}))
-        row.update(faillock.get(user, {}))
-        row.update(authkeys.get(user, {}))
-        row.update(passwd_status.get(user, {}))
-        row.update(parse_auditd_created_disabled(user, payload))
-        row.setdefault("user_name", user)
-        row.setdefault("password_hash_present_flag", False)
-        row.setdefault("password_locked_flag", False)
-        row.setdefault("account_locked_flag", False)
-        row.setdefault("account_disabled_flag", False)
-        row.setdefault("must_change_password_flag", False)
-        row.setdefault("faillock_count", 0)
-        row.setdefault("faillock_locked_flag", False)
-        row.setdefault("ssh_authorized_keys_count", 0)
-        row.setdefault("distinct_source_ip_count_30d", 0)
-        row.setdefault("distinct_source_ip_count_90d", 0)
-        row.setdefault("successful_login_count_7d", 0)
-        row.setdefault("successful_login_count_30d", 0)
-        row.setdefault("successful_login_count_90d", 0)
-        row.setdefault("failed_login_count_7d", 0)
-        row.setdefault("failed_login_count_30d", 0)
-        row.setdefault("failed_login_count_90d", 0)
-        row["source_confidence_code"] = "HIGH" if row.get("last_login_at_utc") or row.get("passwd_status_code") else "MEDIUM"
-        row["source_files_json"] = [x for x in ["/etc/passwd", "/etc/shadow", "/var/log/lastlog", "/var/log/auth.log", "/var/log/secure", "/var/log/audit/audit.log"]]
-        row["raw_payload_json"] = {
-            "passwd_status": row.get("passwd_status_raw"),
-            "lastlog_source": "/var/log/lastlog",
+        password_hash = s.get("password_hash")
+        password_hash_present = bool(password_hash and password_hash not in {"x", "*", "!*", "!!", "!", ""} and (password_hash.startswith("$") or password_hash.startswith("y$")))
+        passwd_status_code = ps.get("passwd_status_code")
+        password_locked = passwd_status_code in {"L", "LK"} or (password_hash or "").startswith("!") or password_hash in {"*", "!*"}
+        must_change = passwd_status_code in {"NP"}
+
+        user_obj = {
+            **base,
+            "passwd_status_code": passwd_status_code,
+            "password_hash_present_flag": password_hash_present,
+            "password_locked_flag": password_locked,
+            "account_locked_flag": False,
+            "account_disabled_flag": False,
+            "must_change_password_flag": must_change,
+            "password_last_change_date": _normalize_chage_date(ch.get("Last password change")),
+            "password_min_days": _to_int_or_none(ch.get("Minimum number of days between password change")) or s.get("shadow_min_days"),
+            "password_max_days": _to_int_or_none(ch.get("Maximum number of days between password change")) or s.get("shadow_max_days"),
+            "password_warn_days": _to_int_or_none(ch.get("Number of days of warning before password expires")) or s.get("shadow_warn_days"),
+            "password_inactive_days": _to_int_or_none(ch.get("Password inactive")) or s.get("shadow_inactive_days"),
+            "account_expire_date": _normalize_chage_date(ch.get("Account expires")),
+            "faillock_count": fl.get("faillock_count", 0),
+            "faillock_locked_flag": fl.get("faillock_locked_flag", False),
+            "ssh_authorized_keys_count": authkeys.get(user_name, 0),
+            "successful_login_count_7d": sum(1 for e in success if e.ts >= collected_at - timedelta(days=7)),
+            "successful_login_count_30d": sum(1 for e in success if e.ts >= collected_at - timedelta(days=30)),
+            "successful_login_count_90d": sum(1 for e in success if e.ts >= collected_at - timedelta(days=90)),
+            "last_success_login_at_utc": dt_text(last_success.ts) if last_success else None,
+            "last_success_login_ip": last_success.ip if last_success else None,
+            "failed_login_count_7d": sum(1 for e in failed if e.ts >= collected_at - timedelta(days=7)),
+            "failed_login_count_30d": sum(1 for e in failed if e.ts >= collected_at - timedelta(days=30)),
+            "failed_login_count_90d": sum(1 for e in failed if e.ts >= collected_at - timedelta(days=90)),
+            "last_failed_login_at_utc": dt_text(last_failed.ts) if last_failed else None,
+            "last_failed_login_ip": last_failed.ip if last_failed else None,
+            "distinct_source_ip_count_30d": len(ips30),
+            "distinct_source_ip_count_90d": len(ips90),
+            "account_created_source": None,
+            "account_created_at_best_effort_utc": None,
+            "account_disabled_source": None,
+            "account_disabled_at_best_effort_utc": None,
+            "source_confidence_code": _source_confidence(success, failed, passwd_status_code),
+            "source_files_json": source_files,
+            "raw_payload_json": {
+                "passwd_status": ps.get("raw"),
+                "platform_family_detected": (raw.get("platform_family_detected") or "").strip() or None,
+                "auth_log_hint": (raw.get("auth_log_hint") or "").strip() or None,
+                "ssh_service_hint": (raw.get("ssh_service_hint") or "").strip() or None,
+            },
+            "events": [
+                {
+                    "timestamp_utc": dt_text(e.ts),
+                    "event_kind": e.kind,
+                    "source_type": e.source_type,
+                    "source_ip": e.ip,
+                    "raw_line": e.line,
+                }
+                for e in ev[-50:]
+            ],
         }
-        row["events"] = collect_events(user, payload)
-        users.append(row)
+        user_rows.append(user_obj)
 
     summary = {
-        "account_count": len(users),
-        "successful_login_count_30d": sum(int(u.get("successful_login_count_30d") or 0) for u in users),
-        "failed_login_count_30d": sum(int(u.get("failed_login_count_30d") or 0) for u in users),
-        "locked_account_count": sum(1 for u in users if bool(u.get("account_locked_flag"))),
-        "disabled_account_count": sum(1 for u in users if bool(u.get("account_disabled_flag"))),
+        "account_count": len(user_rows),
+        "successful_login_count_30d": sum(u["successful_login_count_30d"] for u in user_rows),
+        "failed_login_count_30d": sum(u["failed_login_count_30d"] for u in user_rows),
+        "locked_account_count": sum(1 for u in user_rows if u["password_locked_flag"]),
+        "disabled_account_count": sum(1 for u in user_rows if u["account_disabled_flag"]),
     }
 
     details = {
-        "report_type": "client_account_activity",
-        "collector_version": "1.0.0",
-        "source_window_days": int(payload.get("window_days") or 90),
+        "report_type": REPORT_TYPE,
+        "collector_version": COLLECTOR_VERSION,
+        "source_window_days": raw.get("window_days"),
         "summary": summary,
-        "users": users,
+        "users": user_rows,
     }
 
-    return {
-        "hostname": payload.get("hostname") or "",
-        "group": payload.get("host_group_csv") or "",
-        "ip_address": payload.get("ip_address") or "",
-        "os_distro": payload.get("os_distro") or "",
-        "os_version": payload.get("os_version") or "",
-        "hw_arch": payload.get("hw_arch") or "",
-        "time": payload.get("host_time_text") or "",
-        "changed": str(payload.get("changed") if payload.get("changed") is not None else False).lower(),
-        "unreachable": str(payload.get("unreachable") if payload.get("unreachable") is not None else False).lower(),
-        "failed": str(payload.get("failed") if payload.get("failed") is not None else False).lower(),
+    row = {
+        "hostname": raw.get("hostname") or "",
+        "group": raw.get("host_group_csv") or "",
+        "ip_address": ipv4_or_empty(raw.get("ip_address") or ""),
+        "os_distro": raw.get("os_distro") or "",
+        "os_version": raw.get("os_version") or "",
+        "hw_arch": raw.get("hw_arch") or "",
+        "time": raw.get("host_time_text") or dt_text(collected_at) or "",
+        "changed": str(bool(raw.get("changed", False))).lower(),
+        "unreachable": str(bool(raw.get("unreachable", False))).lower(),
+        "failed": str(bool(raw.get("failed", False))).lower(),
         "details": json.dumps(details, ensure_ascii=False, separators=(",", ":")),
     }
+    return row
+
+
+def _source_confidence(success: list[Event], failed: list[Event], passwd_status_code: str | None) -> str:
+    if success or failed:
+        return "HIGH"
+    if passwd_status_code:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _normalize_chage_date(value: str | None) -> str | None:
+    value = (value or "").strip()
+    if not value or value.lower() == "never":
+        return None
+    for fmt in ["%b %d, %Y", "%Y-%m-%d"]:
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except Exception:
+            pass
+    return value
+
+
+def _to_int(text: str | None) -> int | None:
+    try:
+        if text is None or text == "":
+            return None
+        return int(text)
+    except Exception:
+        return None
+
+
+def _to_int_or_none(text: str | None) -> int | None:
+    text = (text or "").strip()
+    if not text or text.lower() == "never":
+        return None
+    m = re.search(r"-?\d+", text)
+    return int(m.group(0)) if m else None
+
+
+# -------- cli --------
+
+def build_rows(input_dir: Path) -> list[dict[str, Any]]:
+    rows = []
+    for path in sorted(input_dir.glob("*_account_activity_raw.json")):
+        raw = json_load(path)
+        rows.append(build_host_row(raw))
+    return rows
+
+
+def write_csv(rows: list[dict[str, Any]], output_file: Path) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["hostname", "group", "ip_address", "os_distro", "os_version", "hw_arch", "time", "changed", "unreachable", "failed", "details"]
+    with output_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build client_account_activity_report.csv from raw fetched JSON payloads")
-    ap.add_argument("--input-dir", type=Path, required=True)
-    ap.add_argument("--output-file", type=Path, required=True)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir", required=True)
+    parser.add_argument("--output-file", required=True)
+    args = parser.parse_args()
 
-    rows = []
-    for fp in sorted(args.input_dir.glob("*_account_activity_raw.json")):
-        payload = json.loads(fp.read_text(encoding="utf-8"))
-        rows.append(build_report_row(payload))
-
-    args.output_file.parent.mkdir(parents=True, exist_ok=True)
-    with args.output_file.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    rows = build_rows(Path(args.input_dir))
+    write_csv(rows, Path(args.output_file))
     return 0
 
 
