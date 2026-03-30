@@ -1,5 +1,5 @@
 ---
-- name: Generate client account activity report compatible with SQL-first importer (v2)
+- name: Generate client account activity report compatible with SQL-first importer (v3)
   hosts: all
   gather_facts: true
   become: true
@@ -47,23 +47,25 @@
     - name: Detect platform-specific log collection strategy
       ansible.builtin.set_fact:
         account_activity_platform_family: >-
-          {% if ansible_os_family | lower in ['redhat', 'rocky', 'almalinux', 'rhel'] %}
+          {% set distro = (ansible_distribution | default('') | lower) %}
+          {% set family = (ansible_os_family | default('') | lower) %}
+          {% if distro in ['almalinux', 'rocky', 'redhat'] or family == 'redhat' %}
           rhel_like
-          {% elif ansible_os_family | lower in ['debian', 'ubuntu'] %}
+          {% elif distro in ['ubuntu', 'debian'] or family == 'debian' %}
           debian_like
           {% else %}
           generic_linux
           {% endif %}
         account_activity_auth_log_hint: >-
-          {% if ansible_os_family | lower in ['redhat', 'rocky', 'almalinux', 'rhel'] %}
+          {% if (ansible_os_family | default('') | lower) == 'redhat' %}
           /var/log/secure*
-          {% elif ansible_os_family | lower in ['debian', 'ubuntu'] %}
+          {% elif (ansible_os_family | default('') | lower) == 'debian' %}
           /var/log/auth.log*
           {% else %}
           /var/log/secure* or /var/log/auth.log*
           {% endif %}
         account_activity_ssh_service_hint: >-
-          {% if ansible_os_family | lower in ['debian', 'ubuntu'] %}
+          {% if (ansible_os_family | default('') | lower) == 'debian' %}
           ssh/ssh.socket/sshd
           {% else %}
           sshd/sshd.socket/ssh
@@ -115,8 +117,15 @@
       failed_when: false
       loop: "{{ account_activity_local_users }}"
 
-    - name: Collect lastlog for each user
-      ansible.builtin.command: "lastlog -u {{ item }}"
+    - name: Collect lastlog for each user when available
+      ansible.builtin.shell: |
+        if command -v lastlog >/dev/null 2>&1; then
+          lastlog -u {{ item }}
+        else
+          true
+        fi
+      args:
+        executable: /bin/bash
       register: lastlog_cmd
       changed_when: false
       failed_when: false
@@ -125,7 +134,6 @@
 
     - name: Collect faillock for each user when available
       ansible.builtin.shell: |
-        set -o pipefail
         if command -v faillock >/dev/null 2>&1; then
           faillock --user {{ item }}
         else
@@ -243,8 +251,7 @@
       ansible.builtin.shell: |
         set -o pipefail
         if command -v journalctl >/dev/null 2>&1; then
-          journalctl --since "{{ account_activity_window_days }} days ago" \
-            --output=short-iso 2>/dev/null | \
+          journalctl --since "{{ account_activity_window_days }} days ago" --output=short-iso 2>/dev/null | \
             grep -E 'sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|systemd-logind|login\[|agetty|getty|console|tty[0-9]+|sudo|su\[' | \
             head -n 20000
         else
@@ -386,13 +393,20 @@
           {
             "hostname": {{ inventory_hostname | to_json }},
             "host_group_csv": {{ (group_names | join(',')) | to_json }},
-            "ip_address": {{ ansible_default_ipv4.address | default(ansible_host | default('')) | to_json }},
+            "ip_address": {{
+              (
+                ansible_default_ipv4.address
+                | default((ansible_all_ipv4_addresses | default([]) | reject('equalto', '127.0.0.1') | list | first), true)
+                | default('', true)
+              ) | to_json
+            }},
+            "inventory_host_ref": {{ ansible_host | default(inventory_hostname) | to_json }},
             "os_family": {{ ansible_os_family | default('') | to_json }},
             "os_distro": {{ ansible_distribution | default('') | to_json }},
             "os_version": {{ ansible_distribution_version | default('') | to_json }},
-            "platform_family_detected": {{ account_activity_platform_family | default('') | to_json }},
-            "auth_log_hint": {{ account_activity_auth_log_hint | default('') | to_json }},
-            "ssh_service_hint": {{ account_activity_ssh_service_hint | default('') | to_json }},
+            "platform_family_detected": {{ account_activity_platform_family | default('') | trim | to_json }},
+            "auth_log_hint": {{ account_activity_auth_log_hint | default('') | trim | to_json }},
+            "ssh_service_hint": {{ account_activity_ssh_service_hint | default('') | trim | to_json }},
             "hw_arch": {{ ansible_architecture | default('') | to_json }},
             "host_time_text": {{ account_activity_collected_at_utc | to_json }},
             "changed": false,
