@@ -15,7 +15,8 @@
     # Legacy switches kept for template compatibility. They are intentionally disabled
     # in this lightweight profile because the heavy log collection was the main source
     # of runtime and payload size growth.
-    account_activity_collect_lastlog: false
+    # Lightweight login signal used to keep importer compatibility and basic activity context.
+    account_activity_collect_lastlog: true
     account_activity_collect_last: false
     account_activity_collect_lastb: false
     account_activity_collect_faillock: false
@@ -254,6 +255,7 @@
             "group": {{ local_group_cmd.stdout_lines | default([]) | to_json }},
             "shadow": {{ shadow_summary_cmd.stdout_lines | default([]) | to_json }},
             "passwd_status": {{ passwd_status_cmd.results | default([]) | to_json }},
+            "lastlog": {{ lastlog_cmd.results | default([]) | to_json }},
             "sudo_list": {{ sudo_list_cmd.results | default([]) | to_json }},
             "authorized_keys": {{ authorized_keys_cmd.stdout_lines | default([]) | to_json }},
             "su_command_path": {{ su_command_cmd.stdout | default('') | trim | to_json }},
