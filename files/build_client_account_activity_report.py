@@ -21,6 +21,7 @@ SU_CMD_RE = re.compile(r"(^|[\s,])(/usr/bin/su|/bin/su|\bsu\b)([\s,]|$)", re.IGN
 USER_MGMT_RE = re.compile(r"\b(useradd|usermod|userdel|passwd|chage|vipw|visudo)\b", re.IGNORECASE)
 SHELL_ESCAPE_RE = re.compile(r"\b(/bin/bash|/bin/sh|/bin/zsh|/bin/ksh|/usr/bin/env|sudoedit)\b", re.IGNORECASE)
 PASSWD_STATUS_RE = re.compile(r"^(?P<user>\S+)\s+(?P<code>[A-Z]{1,3})\b")
+LASTLOG_TS_RE = re.compile(r"(?P<ts>(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?\s+\d{4})\s*$")
 
 
 def json_load(path: Path) -> dict[str, Any]:
@@ -239,6 +240,78 @@ def parse_authorized_keys(lines: Iterable[str]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _parse_lastlog_ts(value: str) -> datetime | None:
+    for fmt in ("%a %b %d %H:%M:%S %z %Y", "%a %b %d %H:%M:%S %Y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    return None
+
+
+def parse_lastlog(results: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for rec in results or []:
+        user = rec.get("item")
+        stdout_lines = rec.get("stdout_lines") or []
+        stdout = (rec.get("stdout") or "").strip()
+        if not user:
+            continue
+
+        raw_line = ""
+        non_header = [str(line).rstrip("\n") for line in stdout_lines if str(line).strip() and "Username" not in str(line)]
+        if non_header:
+            raw_line = non_header[-1].rstrip()
+        elif stdout:
+            raw_line = stdout.splitlines()[-1].rstrip()
+
+        parsed = {
+            "last_login_at_utc": None,
+            "last_login_source_ip": None,
+            "last_login_tty": None,
+            "never_logged_in_flag": False,
+            "raw": raw_line or None,
+        }
+
+        if not raw_line:
+            out[user] = parsed
+            continue
+
+        if "Never logged in" in raw_line or "**Never logged in**" in raw_line:
+            parsed["never_logged_in_flag"] = True
+            out[user] = parsed
+            continue
+
+        m = LASTLOG_TS_RE.search(raw_line)
+        if not m:
+            out[user] = parsed
+            continue
+
+        dt = _parse_lastlog_ts(m.group("ts"))
+        if dt is None:
+            out[user] = parsed
+            continue
+
+        parsed["last_login_at_utc"] = dt_text(dt)
+
+        prefix = raw_line[:m.start()].rstrip()
+        if prefix.startswith(user):
+            prefix = prefix[len(user):].strip()
+        parts = prefix.split()
+        if parts:
+            parsed["last_login_tty"] = parts[0]
+        if len(parts) >= 2:
+            candidate = parts[1]
+            if candidate != "**Never":
+                parsed["last_login_source_ip"] = candidate
+
+        out[user] = parsed
+    return out
+
+
 def parse_pam_su(lines: Iterable[str]) -> dict[str, Any]:
     parsed_lines: list[str] = []
     restricted_groups: list[str] = []
@@ -416,6 +489,7 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
     shadow = parse_shadow_rows(raw.get("shadow") or [])
     passwd_status = parse_passwd_status(raw.get("passwd_status") or [])
     authorized_keys = parse_authorized_keys(raw.get("authorized_keys") or [])
+    lastlog_by_user = parse_lastlog(raw.get("lastlog") or [])
     pam_su = parse_pam_su(raw.get("pam_su") or [])
     sudo_by_user = parse_sudo_list(raw.get("sudo_list") or [])
     systemd_users = parse_systemd_service_users(raw.get("systemd_service_users") or [])
@@ -451,6 +525,7 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
         shadow_info = shadow.get(user_name, {})
         passwd_info = passwd_status.get(user_name, {})
         authkeys_info = authorized_keys.get(user_name, {"count": 0, "path": None})
+        lastlog_info = lastlog_by_user.get(user_name, {})
         sudo_info = sudo_by_user.get(
             user_name,
             {
@@ -564,11 +639,11 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
             "successful_login_count_7d": 0,
             "successful_login_count_30d": 0,
             "successful_login_count_90d": 0,
-            "last_login_at_utc": None,
-            "last_login_source_ip": None,
-            "last_login_tty": None,
-            "last_success_login_at_utc": None,
-            "last_success_login_ip": None,
+            "last_login_at_utc": lastlog_info.get("last_login_at_utc"),
+            "last_login_source_ip": lastlog_info.get("last_login_source_ip"),
+            "last_login_tty": lastlog_info.get("last_login_tty"),
+            "last_success_login_at_utc": lastlog_info.get("last_login_at_utc"),
+            "last_success_login_ip": lastlog_info.get("last_login_source_ip"),
             "failed_login_count_7d": 0,
             "failed_login_count_30d": 0,
             "failed_login_count_90d": 0,
@@ -582,7 +657,7 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
             "account_disabled_at_best_effort_utc": None,
             "source_confidence_code": source_confidence_code,
             "activity_source_confidence_code": source_confidence_code,
-            "activity_status_code": "NOT_COLLECTED_MINIMAL_PROFILE",
+            "activity_status_code": ("LASTLOG_ONLY" if lastlog_info.get("last_login_at_utc") else ("NO_LOGIN_SEEN_IN_LASTLOG" if lastlog_info.get("never_logged_in_flag") else "NOT_COLLECTED_MINIMAL_PROFILE")),
             "su_command_path": su_command_path,
             "su_command_available_flag": su_command_available_flag,
             "su_restriction_mode": pam_su.get("restriction_mode"),
@@ -609,6 +684,7 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
                 "/etc/group",
                 "/etc/shadow",
                 "/etc/pam.d/su",
+                "lastlog -u <user>",
                 "sudo -l -U <user>",
                 "systemd unit files (*.service User=)",
             ],
@@ -618,6 +694,7 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
                 "auth_log_hint": (raw.get("auth_log_hint") or "").strip() or None,
                 "ssh_service_hint": (raw.get("ssh_service_hint") or "").strip() or None,
                 "sudo_rc": sudo_info.get("sudo_rc"),
+                "lastlog_raw": lastlog_info.get("raw"),
                 "pam_su_summary": pam_su.get("evidence_lines"),
             },
             "privilege_evidence": privilege_evidence,
@@ -632,6 +709,7 @@ def build_host_row(raw: dict[str, Any]) -> dict[str, Any]:
         "service_account_candidate_count": sum(1 for u in user_rows if u.get("is_service_account_candidate_flag")),
         "sudo_capable_count": sum(1 for u in user_rows if u.get("has_sudo_rules_flag")),
         "service_management_capable_count": sum(1 for u in user_rows if u.get("service_management_capability_flag")),
+        "accounts_with_login_timestamp_count": sum(1 for u in user_rows if u.get("last_login_at_utc")),
     }
 
     details = {
