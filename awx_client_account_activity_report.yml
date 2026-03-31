@@ -1,26 +1,46 @@
 ---
-- name: Generate client account activity report compatible with SQL-first importer (v3)
+- name: Generate client account activity report compatible with SQL-first importer (minimal privilege signals)
   hosts: all
   gather_facts: true
   become: true
 
   vars:
-    account_activity_window_days: 90
+    account_activity_window_days: 30
     account_activity_reports_host: "127.0.0.1"
     account_activity_reports_dir: "/var/lib/awx/projects/reports/account_activity"
     account_activity_raw_dir: "{{ account_activity_reports_dir }}/raw"
     account_activity_local_workdir: "/var/tmp/account_activity_collect"
     account_activity_csv_name: "client_account_activity_report.csv"
 
-    account_activity_collect_lastlog: true
-    account_activity_collect_last: true
-    account_activity_collect_lastb: true
-    account_activity_collect_faillock: true
-    account_activity_collect_journalctl: true
-    account_activity_collect_authlog: true
-    account_activity_collect_auditd: true
-    account_activity_collect_who: true
-    account_activity_collect_w: true
+    # Legacy switches kept for template compatibility. They are intentionally disabled
+    # in this lightweight profile because the heavy log collection was the main source
+    # of runtime and payload size growth.
+    account_activity_collect_lastlog: false
+    account_activity_collect_last: false
+    account_activity_collect_lastb: false
+    account_activity_collect_faillock: false
+    account_activity_collect_journalctl: false
+    account_activity_collect_authlog: false
+    account_activity_collect_auditd: false
+    account_activity_collect_who: false
+    account_activity_collect_w: false
+
+    # New lightweight privilege-focused signals.
+    account_activity_collect_passwd_status: true
+    account_activity_collect_sudoers: true
+    account_activity_collect_authorized_keys: true
+    account_activity_collect_su_config: true
+    account_activity_collect_systemd_service_users: true
+
+    # Configurable helper lists used later by the parser/AI module.
+    account_activity_privileged_group_names:
+      - root
+      - wheel
+      - sudo
+      - adm
+      - admin
+    account_activity_privileged_group_gids:
+      - 0
 
   pre_tasks:
     - name: Ensure local workdir exists on managed host
@@ -44,7 +64,7 @@
       ansible.builtin.set_fact:
         account_activity_collected_at_utc: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
 
-    - name: Detect platform-specific log collection strategy
+    - name: Detect platform-specific collection hints
       ansible.builtin.set_fact:
         account_activity_platform_family: >-
           {% set distro = (ansible_distribution | default('') | lower) %}
@@ -71,31 +91,40 @@
           sshd/sshd.socket/ssh
           {% endif %}
 
-    - name: Collect passwd database
-      ansible.builtin.command: getent passwd
-      register: getent_passwd_cmd
+    - name: Collect local passwd database only
+      ansible.builtin.command: cat /etc/passwd
+      register: local_passwd_cmd
       changed_when: false
 
-    - name: Collect group database
-      ansible.builtin.command: getent group
-      register: getent_group_cmd
+    - name: Collect local group database only
+      ansible.builtin.command: cat /etc/group
+      register: local_group_cmd
       changed_when: false
 
-    - name: Read /etc/shadow safely
+    - name: Collect redacted shadow summary
       ansible.builtin.shell: |
-        awk -F: '{print $1":"$2":"$3":"$4":"$5":"$6":"$7":"$8":"$9}' /etc/shadow
+        awk -F: '
+          {
+            state="OTHER";
+            pw=$2;
+            if (pw == "") state="EMPTY";
+            else if (pw == "*" || pw == "!*" || pw == "!" || pw == "!!" || pw ~ /^!/) state="LOCKED";
+            else if (pw ~ /^\$/ || pw ~ /^y\$/) state="HASH";
+            printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1, state, $3, $4, $5, $6, $7, $8;
+          }
+        ' /etc/shadow
       args:
         executable: /bin/bash
-      register: shadow_cmd
+      register: shadow_summary_cmd
       changed_when: false
       failed_when: false
       no_log: true
 
-    - name: Build local user list from getent passwd
+    - name: Build local user list from /etc/passwd
       ansible.builtin.set_fact:
         account_activity_local_users: >-
           {{
-            getent_passwd_cmd.stdout_lines
+            local_passwd_cmd.stdout_lines
             | map('split', ':')
             | selectattr('0', 'defined')
             | map('first')
@@ -103,279 +132,27 @@
           }}
 
   tasks:
-    - name: Collect passwd -S for each user
+    - name: Collect passwd -S for each local user
       ansible.builtin.command: "passwd -S {{ item }}"
       register: passwd_status_cmd
       changed_when: false
       failed_when: false
       loop: "{{ account_activity_local_users }}"
+      when: account_activity_collect_passwd_status
 
-    - name: Collect chage -l for each user
-      ansible.builtin.command: "chage -l {{ item }}"
-      register: chage_cmd
+    - name: Evaluate sudo privileges for each local user
+      ansible.builtin.command: "sudo -n -l -U {{ item }}"
+      register: sudo_list_cmd
       changed_when: false
       failed_when: false
       loop: "{{ account_activity_local_users }}"
-
-    - name: Collect lastlog for each user when available
-      ansible.builtin.shell: |
-        if command -v lastlog >/dev/null 2>&1; then
-          lastlog -u {{ item }}
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: lastlog_cmd
-      changed_when: false
-      failed_when: false
-      loop: "{{ account_activity_local_users }}"
-      when: account_activity_collect_lastlog
-
-    - name: Collect faillock for each user when available
-      ansible.builtin.shell: |
-        if command -v faillock >/dev/null 2>&1; then
-          faillock --user {{ item }}
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: faillock_cmd
-      changed_when: false
-      failed_when: false
-      loop: "{{ account_activity_local_users }}"
-      when: account_activity_collect_faillock
-
-    - name: Collect who output for currently logged sessions
-      ansible.builtin.command: who
-      register: who_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_who
-
-    - name: Collect w output for currently logged sessions
-      ansible.builtin.command: w
-      register: w_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_w
-
-    - name: Collect successful login history with source IPs
-      ansible.builtin.shell: |
-        set -o pipefail
-        if command -v last >/dev/null 2>&1; then
-          last -F -i -w | head -n 5000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: last_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_last
-
-    - name: Collect normalized successful login evidence (SSH vs tty/console)
-      ansible.builtin.shell: |
-        set -o pipefail
-        if command -v last >/dev/null 2>&1; then
-          LC_ALL=C last -F -i -w | awk '
-            BEGIN { OFS="|" }
-            /wtmp begins/ { next }
-            /^reboot[[:space:]]/ { next }
-            /^shutdown[[:space:]]/ { next }
-            /^[[:space:]]*$/ { next }
-            {
-              user=$1; term=$2; src=$3;
-              if (user == "" || term == "") next;
-              source_type="OTHER";
-              if (term ~ /^pts\//) source_type="SSH";
-              else if (term ~ /^tty/ || term == "console") source_type="CONSOLE";
-              print source_type, user, term, src, $0;
-            }
-          ' | head -n 5000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: last_normalized_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_last
-
-    - name: Collect failed login history with source IPs
-      ansible.builtin.shell: |
-        set -o pipefail
-        if command -v lastb >/dev/null 2>&1 && [ -f /var/log/btmp ]; then
-          lastb -F -i -w | head -n 5000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: lastb_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_lastb
-
-    - name: Collect normalized failed login evidence (SSH vs tty/console)
-      ansible.builtin.shell: |
-        set -o pipefail
-        if command -v lastb >/dev/null 2>&1 && [ -f /var/log/btmp ]; then
-          LC_ALL=C lastb -F -i -w | awk '
-            BEGIN { OFS="|" }
-            /btmp begins/ { next }
-            /^[[:space:]]*$/ { next }
-            {
-              user=$1; term=$2; src=$3;
-              if (user == "" || term == "") next;
-              source_type="OTHER";
-              if (term ~ /^pts\//) source_type="SSH";
-              else if (term ~ /^tty/ || term == "console") source_type="CONSOLE";
-              print source_type, user, term, src, $0;
-            }
-          ' | head -n 5000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: lastb_normalized_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_lastb
-
-    - name: Collect journalctl auth-related entries across Alma/RHEL and Ubuntu/Debian variants
-      ansible.builtin.shell: |
-        set -o pipefail
-        if command -v journalctl >/dev/null 2>&1; then
-          journalctl --since "{{ account_activity_window_days }} days ago" --output=short-iso 2>/dev/null | \
-            grep -E 'sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|systemd-logind|login\[|agetty|getty|console|tty[0-9]+|sudo|su\[' | \
-            head -n 20000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: journal_auth_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_journalctl
-
-    - name: Collect normalized journalctl session evidence (SSH vs tty/console)
-      ansible.builtin.shell: |
-        set -o pipefail
-        if command -v journalctl >/dev/null 2>&1; then
-          journalctl --since "{{ account_activity_window_days }} days ago" --output=short-iso 2>/dev/null | \
-          awk '
-            BEGIN { OFS="|" }
-            /sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket/ {
-              print "SSH", $0; next
-            }
-            /systemd-logind|login\[|agetty|getty|console|tty[0-9]+/ {
-              print "CONSOLE", $0; next
-            }
-          ' | head -n 20000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: journal_normalized_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_journalctl
-
-    - name: Collect auth.log or secure fallback including rotated logs
-      ansible.builtin.shell: |
-        set -o pipefail
-        files=$(find /var/log -maxdepth 1 -type f \( -name 'secure*' -o -name 'auth.log*' \) 2>/dev/null | sort -r)
-        if [ -n "$files" ]; then
-          while IFS= read -r f; do
-            case "$f" in
-              *.gz)
-                zgrep -hE 'sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|pam_unix\((sshd|login):session\)|systemd-logind|login\[|agetty|getty|console|tty[0-9]+|sudo|su\[' "$f" 2>/dev/null || true
-                ;;
-              *)
-                grep -hE 'sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|pam_unix\((sshd|login):session\)|systemd-logind|login\[|agetty|getty|console|tty[0-9]+|sudo|su\[' "$f" 2>/dev/null || true
-                ;;
-            esac
-          done <<< "$files" | tail -n 20000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: authlog_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_authlog
-
-    - name: Collect normalized auth log evidence (SSH vs tty/console) from current and rotated logs
-      ansible.builtin.shell: |
-        set -o pipefail
-        files=$(find /var/log -maxdepth 1 -type f \( -name 'secure*' -o -name 'auth.log*' \) 2>/dev/null | sort -r)
-        if [ -n "$files" ]; then
-          while IFS= read -r f; do
-            case "$f" in
-              *.gz)
-                zgrep -hE 'sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|pam_unix\((sshd|login):session\)|systemd-logind|login\[|agetty|getty|console|tty[0-9]+' "$f" 2>/dev/null || true
-                ;;
-              *)
-                grep -hE 'sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|pam_unix\((sshd|login):session\)|systemd-logind|login\[|agetty|getty|console|tty[0-9]+' "$f" 2>/dev/null || true
-                ;;
-            esac
-          done <<< "$files" | awk '
-            BEGIN { OFS="|" }
-            /sshd|ssh\[|sshd-session|ssh\.service|ssh\.socket|sshd\.service|sshd\.socket|pam_unix\(sshd:session\)/ {
-              print "SSH", $0; next
-            }
-            /pam_unix\(login:session\)|systemd-logind|login\[|agetty|getty|console|tty[0-9]+/ {
-              print "CONSOLE", $0; next
-            }
-          ' | tail -n 20000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: authlog_normalized_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_authlog
-
-    - name: Collect auditd account-management and session entries including rotated logs when available
-      ansible.builtin.shell: |
-        set -o pipefail
-        files=$(find /var/log/audit -maxdepth 1 -type f \( -name 'audit.log*' \) 2>/dev/null | sort -r)
-        if [ -n "$files" ]; then
-          while IFS= read -r f; do
-            case "$f" in
-              *.gz)
-                zgrep -hE '(/etc/passwd|/etc/shadow|useradd|usermod|userdel|passwd|chage|faillock|USER_LOGIN|USER_AUTH|USER_START|USER_END|acct=|terminal=|addr=)' "$f" 2>/dev/null || true
-                ;;
-              *)
-                grep -hE '(/etc/passwd|/etc/shadow|useradd|usermod|userdel|passwd|chage|faillock|USER_LOGIN|USER_AUTH|USER_START|USER_END|acct=|terminal=|addr=)' "$f" 2>/dev/null || true
-                ;;
-            esac
-          done <<< "$files" | tail -n 20000
-        else
-          true
-        fi
-      args:
-        executable: /bin/bash
-      register: auditd_cmd
-      changed_when: false
-      failed_when: false
-      when: account_activity_collect_auditd
+      when: account_activity_collect_sudoers
 
     - name: Collect authorized_keys metadata
       ansible.builtin.shell: |
         set -o pipefail
         awk -F: '{print $1":"$6}' /etc/passwd | while IFS=: read -r u h; do
-          if [ -f "$h/.ssh/authorized_keys" ]; then
+          if [ -n "$h" ] && [ -f "$h/.ssh/authorized_keys" ]; then
             echo "$u|$h/.ssh/authorized_keys|$(wc -l < "$h/.ssh/authorized_keys")"
           fi
         done
@@ -384,6 +161,64 @@
       register: authorized_keys_cmd
       changed_when: false
       failed_when: false
+      when: account_activity_collect_authorized_keys
+
+    - name: Detect su command path
+      ansible.builtin.shell: |
+        if command -v su >/dev/null 2>&1; then
+          command -v su
+        fi
+      args:
+        executable: /bin/bash
+      register: su_command_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_su_config
+
+    - name: Collect relevant su PAM configuration lines
+      ansible.builtin.shell: |
+        for f in /etc/pam.d/su /etc/pam.d/su-l; do
+          if [ -f "$f" ]; then
+            awk '
+              /^[[:space:]]*#/ { next }
+              /pam_wheel\.so|pam_rootok\.so|pam_unix\.so/ {
+                print FILENAME "|" $0
+              }
+            ' "$f"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: pam_su_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_su_config
+
+    - name: Collect systemd service User mappings
+      ansible.builtin.shell: |
+        set -o pipefail
+        for base in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+          [ -d "$base" ] || continue
+          find "$base" -type f -name '*.service' -print0 2>/dev/null
+        done | while IFS= read -r -d '' f; do
+          user=$(awk -F= '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*User[[:space:]]*=/ {
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
+              print $2;
+              exit
+            }
+          ' "$f")
+          if [ -n "$user" ]; then
+            printf "%s|%s|%s\n" "$user" "$f" "$(basename "$f" .service)"
+          fi
+        done | awk '!seen[$0]++'
+      args:
+        executable: /bin/bash
+      register: systemd_service_users_cmd
+      changed_when: false
+      failed_when: false
+      when: account_activity_collect_systemd_service_users
 
     - name: Save raw payload on target
       ansible.builtin.copy:
@@ -413,25 +248,17 @@
             "unreachable": false,
             "failed": false,
             "window_days": {{ account_activity_window_days | int }},
-            "passwd": {{ getent_passwd_cmd.stdout_lines | default([]) | to_json }},
-            "group": {{ getent_group_cmd.stdout_lines | default([]) | to_json }},
-            "shadow": {{ shadow_cmd.stdout_lines | default([]) | to_json }},
+            "configured_privileged_group_names": {{ account_activity_privileged_group_names | default([]) | to_json }},
+            "configured_privileged_group_gids": {{ account_activity_privileged_group_gids | default([]) | to_json }},
+            "passwd": {{ local_passwd_cmd.stdout_lines | default([]) | to_json }},
+            "group": {{ local_group_cmd.stdout_lines | default([]) | to_json }},
+            "shadow": {{ shadow_summary_cmd.stdout_lines | default([]) | to_json }},
             "passwd_status": {{ passwd_status_cmd.results | default([]) | to_json }},
-            "chage": {{ chage_cmd.results | default([]) | to_json }},
-            "lastlog": {{ lastlog_cmd.results | default([]) | to_json }},
-            "faillock": {{ faillock_cmd.results | default([]) | to_json }},
-            "who": {{ who_cmd.stdout_lines | default([]) | to_json }},
-            "w": {{ w_cmd.stdout_lines | default([]) | to_json }},
-            "last": {{ last_cmd.stdout_lines | default([]) | to_json }},
-            "last_normalized": {{ last_normalized_cmd.stdout_lines | default([]) | to_json }},
-            "lastb": {{ lastb_cmd.stdout_lines | default([]) | to_json }},
-            "lastb_normalized": {{ lastb_normalized_cmd.stdout_lines | default([]) | to_json }},
-            "journal_auth": {{ journal_auth_cmd.stdout_lines | default([]) | to_json }},
-            "journal_normalized": {{ journal_normalized_cmd.stdout_lines | default([]) | to_json }},
-            "authlog": {{ authlog_cmd.stdout_lines | default([]) | to_json }},
-            "authlog_normalized": {{ authlog_normalized_cmd.stdout_lines | default([]) | to_json }},
-            "auditd": {{ auditd_cmd.stdout_lines | default([]) | to_json }},
-            "authorized_keys": {{ authorized_keys_cmd.stdout_lines | default([]) | to_json }}
+            "sudo_list": {{ sudo_list_cmd.results | default([]) | to_json }},
+            "authorized_keys": {{ authorized_keys_cmd.stdout_lines | default([]) | to_json }},
+            "su_command_path": {{ su_command_cmd.stdout | default('') | trim | to_json }},
+            "pam_su": {{ pam_su_cmd.stdout_lines | default([]) | to_json }},
+            "systemd_service_users": {{ systemd_service_users_cmd.stdout_lines | default([]) | to_json }}
           }
       no_log: true
 
